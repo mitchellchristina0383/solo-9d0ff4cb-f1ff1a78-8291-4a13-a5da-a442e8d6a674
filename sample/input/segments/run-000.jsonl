@@ -1,0 +1,7 @@
+{"key": 1, "payload": "alpha", "source": "run-000.jsonl", "line": 0}
+{"key": 3, "payload": "gamma", "source": "run-000.jsonl", "line": 1}
+{"key": 5, "payload": "epsilon-r0", "source": "run-000.jsonl", "line": 2}
+{"key": 8, "payload": "theta-r0", "source": "run-000.jsonl", "line": 3}
+{"key": 12, "payload": "mu-r0-a", "source": "run-000.jsonl", "line": 4}
+{"key": 12, "payload": "mu-r0-b", "source": "run-000.jsonl", "line": 5}
+{"key": 15, "payload": "xi-r0", "source": "run-000.jsonl", "line": 6}

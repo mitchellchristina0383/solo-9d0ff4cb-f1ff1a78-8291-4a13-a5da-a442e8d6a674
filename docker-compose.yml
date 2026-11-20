@@ -1,0 +1,25 @@
+services:
+  merge-service:
+    build: .
+    image: merge-service:local
+    container_name: merge-service
+    ports:
+      - "8000:8000"
+    environment:
+      # 容器内路径，对应下方两个卷挂载
+      MERGE_MOUNT_DIR: /data/input
+      MERGE_WORK_DIR: /data/work
+    volumes:
+      # 各路 JSONL 段文件挂这里；归并发布后服务会回收（删除）已消费完的段
+      - ./sample/input:/data/input
+      # 状态 state.json 与已发布页持久化在这里，容器重建后可续跑
+      - merge-work:/data/work
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  merge-work:

@@ -1,0 +1,19 @@
+{
+  "job_id": "demo",
+  "key_field": "key",
+  "page_size": 4,
+  "segments": [
+    {
+      "path": "segments/run-000.jsonl",
+      "order": 0
+    },
+    {
+      "path": "segments/run-001.jsonl",
+      "order": 1
+    },
+    {
+      "path": "segments/run-002.jsonl",
+      "order": 2
+    }
+  ]
+}
