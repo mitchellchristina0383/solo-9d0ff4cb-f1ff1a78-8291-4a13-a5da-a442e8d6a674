@@ -63,11 +63,15 @@ def wait_ready(proc: subprocess.Popen) -> None:
     raise RuntimeError("服务未在 10s 内就绪")
 
 
-def start_server(work: Path, mount: Path) -> subprocess.Popen:
+def start_server(work: Path, mount: Path, limit: int | None = None) -> subprocess.Popen:
     env = os.environ.copy()
     env["MERGE_MOUNT_DIR"] = str(mount)
     env["MERGE_WORK_DIR"] = str(work)
-    env["PYTHONPATH"] = str(ROOT)
+    # 保留调用方已有的 PYTHONPATH（例如本地依赖目录），再补仓库根目录
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(ROOT) + (os.pathsep + existing if existing else "")
+    if limit is not None:
+        env["MERGE_MAX_OPEN_INPUT_FILES"] = str(limit)
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app",
          "--host", "127.0.0.1", "--port", "8765", "--log-level", "warning"],

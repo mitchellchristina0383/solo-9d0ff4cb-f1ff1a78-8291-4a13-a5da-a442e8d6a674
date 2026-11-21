@@ -2,12 +2,15 @@
 
 设计要点
 --------
-1. 内存占用：每一路任意时刻只保留一条待比较记录，用堆选最小
-   ``(key, 路序 order, 路内行序 seq)``。整段文件不进内存，
-   通过字节偏移 ``offset`` 顺序扫描。
+1. 内存与句柄占用：每一路任意时刻只保留一条待比较记录，用堆选最小
+   ``(key, 路序 order, 路内行序 seq)``。整段文件不进内存，通过字节
+   偏移 ``offset`` 顺序扫描；输入段文件句柄由进程级额度统一约束，
+   路数可以大于额度（见 ``InputHandleLimiter``）。
 2. 页是发布单元：先写 ``page-XXXXX.jsonl.tmp``，fsync 后原子
    ``os.replace`` 成正式页文件，再写新的 ``state.json``（同样
    tmp + fsync + replace）。任何时刻崩溃，已发布页都保持原样。
+   一次推进中途失败时，本次未提交的页不可见，状态仍指向上一次
+   已提交的进度，重试从那里继续。
 3. 回收（两阶段提交）：某路全部记录随页发布后，先提交
    ``exhausted + 偏移`` 状态，再 unlink 段文件，最后提交
    ``reclaimed`` 标记。任何一步崩溃，重启时 ``_open_job`` 都能
@@ -24,10 +27,13 @@ import heapq
 import json
 import os
 import threading
+from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
+from .config import DEFAULT_MAX_OPEN_INPUT_FILES
 from .models import (
     AdvanceResult,
     JobCreate,
@@ -100,14 +106,261 @@ class JobNotFound(EngineError):
     pass
 
 
+class HandleSlot:
+    """一个已打开的输入段文件槽位。
+
+    ``pins`` > 0 表示正被某次读取占用，不能被回收；``pos`` 是文件游标
+    在磁盘上的最后已知位置，重新打开/复用时据此 seek。游标的权威值
+    始终保存在 :class:`_RunReader` 的 ``pos`` 里——句柄被挤出缓存后
+    再次打开，仍从读过的位置继续。
+    """
+
+    __slots__ = ("f", "pos", "pins", "owner")
+
+    def __init__(self, f: BinaryIO, pos: int, owner: int | None = None):
+        self.f = f
+        self.pos = pos
+        self.pins = 0
+        self.owner = owner
+
+
+class InputHandleLimiter:
+    """进程内输入段文件句柄额度，所有作业、所有操作共享。
+
+    容量为 ``max_open`` 个已打开文件（另加正在打开中的预留槽位）。
+    读取时 ``hold()`` 先钉住一个句柄，读完再松开；松开后的句柄留在
+    LRU 缓存里，后续读取同一路直接复用。容量满时会淘汰最久未使用
+    且未被钉住的句柄——因此路数（段数）可以大于额度：打开、读一条、
+    按需淘汰、下次再按偏移重新打开即可，归并顺序不受影响。
+
+    打开文件的操作在全局锁之外进行（只先预留一个槽位），所以某个
+    作业的 ``open()`` 卡在慢盘/管道上时，只要还有空余名额，其他作业
+    仍能取得句柄并推进。
+
+    读取抛错时 ``hold()`` 会丢弃该句柄并归还名额；一次推进失败时
+    服务层再 ``drop_job()`` 归还该作业本次占用的全部名额。
+    """
+
+    def __init__(self, max_open: int = DEFAULT_MAX_OPEN_INPUT_FILES):
+        if isinstance(max_open, bool) or not isinstance(max_open, int) or max_open < 1:
+            raise ValueError(f"max_open 必须是正整数，收到 {max_open!r}")
+        self.max_open = max_open
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._handles: "OrderedDict[Any, HandleSlot]" = OrderedDict()
+        self._reserved = 0
+        # 可观测计数（测试与 /limits 使用）
+        self.open_calls = 0
+        self.reuse_hits = 0
+        self.evictions = 0
+        self.peak_open = 0
+        self.waits = 0
+
+    # -- 内部 ---------------------------------------------------------- #
+    def _evict_lru_unpinned_locked(self) -> bool:
+        for key, slot in self._handles.items():
+            if slot.pins == 0:
+                del self._handles[key]
+                try:
+                    slot.f.close()
+                except OSError:
+                    pass
+                self.evictions += 1
+                self._cond.notify_all()
+                return True
+        return False
+
+    def _slot_for_self_locked(self, key: Any, tid: int) -> HandleSlot | None:
+        slot = self._handles.get(key)
+        if slot is None:
+            return None
+        if slot.pins > 0 and slot.owner != tid:
+            # 同一段不应被两个线程同时读；等待持有者松开，避免共享游标
+            return None
+        self._handles.move_to_end(key)
+        slot.pins += 1
+        slot.owner = tid
+        self.reuse_hits += 1
+        return slot
+
+    @contextmanager
+    def hold(self, key: Any, path: Path, pos: int) -> Iterator[BinaryIO]:
+        """取得并钉住一个句柄，返回定位在 ``pos`` 的文件对象。"""
+        f = self.acquire(key, path, pos)
+        try:
+            yield f
+        except BaseException:
+            # 读段出错：关闭并向全局额度归还这个名额
+            self.invalidate(key)
+            raise
+        else:
+            self.release(key)
+
+    def acquire(self, key: Any, path: Path, pos: int) -> BinaryIO:
+        """取得并钉住一个句柄（容量满时淘汰未钉住的最久未用句柄）。"""
+        tid = threading.get_ident()
+        slot: HandleSlot | None = None
+        while True:
+            with self._cond:
+                candidate = self._handles.get(key)
+                if candidate is not None and candidate.pins > 0 and candidate.owner != tid:
+                    # 同一段不应被两个线程同时读；等待持有者松开，避免共享游标
+                    self.waits += 1
+                    self._cond.wait()
+                    continue
+                slot = self._slot_for_self_locked(key, tid)
+                if slot is not None:
+                    break
+                if len(self._handles) + self._reserved < self.max_open:
+                    self._reserved += 1
+                    break
+                if self._evict_lru_unpinned_locked():
+                    continue
+                # 全部句柄都被钉住（例如别的作业读盘卡住且额度已用满）
+                self.waits += 1
+                self._cond.wait()
+
+        if slot is not None:
+            try:
+                if slot.pos != pos:
+                    slot.f.seek(pos)
+                    slot.pos = pos
+            except BaseException:
+                with self._cond:
+                    slot.pins = max(0, slot.pins - 1)
+                    slot.owner = None
+                    self._cond.notify_all()
+                self.invalidate(key)
+                raise
+            return slot.f
+
+        # 名额已预留，真正的 open 在锁外进行，慢盘不会阻塞其他作业
+        try:
+            f = open(path, "rb")
+        except BaseException:
+            with self._cond:
+                self._reserved -= 1
+                self._cond.notify_all()
+            raise
+        try:
+            if pos:
+                f.seek(pos)
+        except BaseException:
+            try:
+                f.close()
+            except OSError:
+                pass
+            with self._cond:
+                self._reserved -= 1
+                self._cond.notify_all()
+            raise
+        with self._cond:
+            self._reserved -= 1
+            self.open_calls += 1
+            slot = HandleSlot(f=f, pos=pos, owner=tid)
+            slot.pins = 1
+            self._handles[key] = slot
+            self.peak_open = max(self.peak_open, len(self._handles) + self._reserved)
+            self._cond.notify_all()
+        return f
+
+    def release(self, key: Any) -> None:
+        """松开钉住（句柄留在缓存里供后续复用）。"""
+        with self._cond:
+            slot = self._handles.get(key)
+            if slot is None:
+                return
+            try:
+                slot.pos = slot.f.tell()
+            except (OSError, ValueError):
+                # tell 失败说明句柄已不可用，直接丢弃归还
+                del self._handles[key]
+                try:
+                    slot.f.close()
+                except OSError:
+                    pass
+                self._cond.notify_all()
+                return
+            slot.pins = max(0, slot.pins - 1)
+            slot.owner = None
+            self._handles.move_to_end(key)
+            self._cond.notify_all()
+
+    def invalidate(self, key: Any) -> None:
+        """读取出错时关闭并移除句柄，归还名额（幂等）。"""
+        self.discard(key)
+
+    def discard(self, key: Any) -> None:
+        """关闭并移除指定句柄（若仍在缓存中），归还名额。"""
+        with self._cond:
+            slot = self._handles.pop(key, None)
+            if slot is not None:
+                slot.pins = 0
+                slot.owner = None
+                try:
+                    slot.f.close()
+                except OSError:
+                    pass
+            self._cond.notify_all()
+
+    def drop_job(self, job_id: str) -> int:
+        """关闭某作业名下的全部句柄，返回释放的数量。
+
+        用于推进/登记失败时归还本次请求占用的名额。调用方持有该作业
+        的锁，因此不会误关其他线程正在读的句柄。
+        """
+        with self._cond:
+            keys = [k for k, s in self._handles.items() if k and k[0] == job_id]
+        for key in keys:
+            self.discard(key)
+        return len(keys)
+
+    def close_all(self) -> None:
+        with self._cond:
+            keys = list(self._handles)
+        for key in keys:
+            self.discard(key)
+
+    @property
+    def open_count(self) -> int:
+        with self._cond:
+            return len(self._handles)
+
+    def job_open_count(self, job_id: str) -> int:
+        with self._cond:
+            return sum(1 for k in self._handles if k and k[0] == job_id)
+
+    def stats(self) -> dict[str, int]:
+        with self._cond:
+            open_now = len(self._handles)
+            reserved = self._reserved
+        return {
+            "max_open": self.max_open,
+            "open_now": open_now,
+            "reserved": reserved,
+            "open_calls": self.open_calls,
+            "reuse_hits": self.reuse_hits,
+            "evictions": self.evictions,
+            "peak_open": self.peak_open,
+            "waits": self.waits,
+        }
+
+
 @dataclass
 class _RunReader:
-    """某一路在一次 advance 内的运行态。"""
+    """某一路在一次 advance 内的运行态（不长期持有文件句柄）。"""
 
     index: int
+    job_id: str
     state: SegmentState
-    f: Any  # 已打开的文本文件对象
+    path: Path
     seq: int  # 路内下一条记录的行序号（仅用于堆排序，不持久化）
+    pos: int  # 下一条待读记录的字节偏移（权威游标）
+
+    @property
+    def handle_key(self) -> tuple[str, str, int]:
+        """句柄缓存键：同作业同路在一次或多次推进间复用。"""
+        return (self.job_id, "read", self.index)
 
 
 @dataclass
@@ -126,6 +379,25 @@ class _HeapEntry:
         return (self.key, self.order, self.seq) < (other.key, other.order, other.seq)
 
 
+_limiters: dict[str, InputHandleLimiter] = {}
+_limiters_guard = threading.Lock()
+
+
+def _limiter_for(work_dir: Path, max_open: int) -> InputHandleLimiter:
+    """按工作目录共享同一个句柄额度器（同进程内）。"""
+    key = str(work_dir)
+    with _limiters_guard:
+        limiter = _limiters.get(key)
+        if limiter is None:
+            limiter = InputHandleLimiter(max_open)
+            _limiters[key] = limiter
+        elif limiter.max_open != max_open:
+            # 同一工作目录出现不同额度（通常只会发生在测试里）：
+            # 以最新配置为准，已缓存的句柄数量不会超过旧上限 → 仍受控。
+            limiter.max_open = max_open
+        return limiter
+
+
 class MergeService:
     """归并服务，按挂载目录管理多个作业。"""
 
@@ -134,12 +406,26 @@ class MergeService:
     _global_locks: dict[tuple[str, str], threading.Lock] = {}
     _global_locks_guard = threading.Lock()
 
-    def __init__(self, mount_dir: Path, work_dir: Path, crash_hook: CrashHook | None = None):
+    def __init__(
+        self,
+        mount_dir: Path,
+        work_dir: Path,
+        crash_hook: CrashHook | None = None,
+        max_open_input_files: int = DEFAULT_MAX_OPEN_INPUT_FILES,
+        limiter: InputHandleLimiter | None = None,
+    ):
         self.mount_dir = Path(mount_dir).resolve()
         self.work_dir = Path(work_dir).resolve()
         self.mount_dir.mkdir(parents=True, exist_ok=True)
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self._crash_hook: CrashHook | None = crash_hook
+        # 句柄额度是进程级共享的：同一工作目录下的服务实例（多 app /
+        # 测试里的多个实例）必须共用同一个 limiter，否则各自计数会
+        # 突破配置额度。显式传入 limiter 时以调用方为准。
+        if limiter is not None:
+            self.limiter = limiter
+        else:
+            self.limiter = _limiter_for(self.work_dir, max_open_input_files)
 
     # ------------------------------------------------------------------ #
     # 路径与校验
@@ -192,48 +478,64 @@ class MergeService:
     def register_job(self, req: JobCreate) -> JobStatus:
         job_dir = self._job_dir(req.job_id)
         with self._get_lock(req.job_id):
-            state_path = job_dir / STATE_FILENAME
-            if state_path.exists():
-                existing = self._read_state(req.job_id)
-                # 幂等：登记参数一致则直接返回当前状态，便于客户端重试
-                same = (
-                    existing.key_field == req.key_field
-                    and existing.page_size == req.page_size
-                    and [s.path for s in existing.segments] == [s.path for s in req.segments]
-                    and [s.order for s in existing.segments] == [s.order for s in req.segments]
-                )
-                if same:
-                    return existing
-                raise EngineError(f"作业 {req.job_id} 已存在且登记参数不一致")
+            try:
+                return self._register_locked(req, job_dir)
+            finally:
+                # 登记校验读段出错（EngineError/OSError）时，归还本次
+                # 校验占用的句柄名额，避免坏段请求持续占用额度。
+                self.limiter.drop_job(req.job_id)
 
-            # 校验段文件：存在、可读、键为整数且全局非降序
-            seg_states: list[SegmentState] = []
-            for seg in req.segments:
-                p = self._segment_path(seg.path)
-                if not p.is_file():
-                    raise EngineError(f"段文件不存在: {seg.path}")
-                self._validate_sorted_segment(p, req.key_field, seg.path)
-                seg_states.append(SegmentState(path=seg.path, order=seg.order))
-
-            job_dir.mkdir(parents=True, exist_ok=True)
-            status = JobStatus(
-                job_id=req.job_id,
-                key_field=req.key_field,
-                page_size=req.page_size,
-                segments=seg_states,
-                published_pages=0,
-                total_published_rows=0,
-                finished=False,
-                next_page_no=1,
-                page_counts=[],
+    def _register_locked(self, req: JobCreate, job_dir: Path) -> JobStatus:
+        state_path = job_dir / STATE_FILENAME
+        if state_path.exists():
+            existing = self._read_state(req.job_id)
+            # 幂等：登记参数一致则直接返回当前状态，便于客户端重试
+            same = (
+                existing.key_field == req.key_field
+                and existing.page_size == req.page_size
+                and [s.path for s in existing.segments] == [s.path for s in req.segments]
+                and [s.order for s in existing.segments] == [s.order for s in req.segments]
             )
-            self._write_state(req.job_id, status)
-            return status
+            if same:
+                return existing
+            raise EngineError(f"作业 {req.job_id} 已存在且登记参数不一致")
 
-    def _validate_sorted_segment(self, path: Path, key_field: str, rel: str) -> None:
-        """流式校验：每行是 JSON 对象，键为整数，且键非降序。"""
+        # 校验段文件：存在、可读、键为整数且全局非降序。
+        # 校验按路序逐段流式进行，任何时刻只占一个句柄——路数可超过额度。
+        for seg in req.segments:
+            p = self._segment_path(seg.path)
+            if not p.is_file():
+                raise EngineError(f"段文件不存在: {seg.path}")
+        seg_states: list[SegmentState] = []
+        for seg in req.segments:
+            p = self._segment_path(seg.path)
+            self._validate_sorted_segment(req.job_id, p, req.key_field, seg.path)
+            seg_states.append(SegmentState(path=seg.path, order=seg.order))
+
+        job_dir.mkdir(parents=True, exist_ok=True)
+        status = JobStatus(
+            job_id=req.job_id,
+            key_field=req.key_field,
+            page_size=req.page_size,
+            segments=seg_states,
+            published_pages=0,
+            total_published_rows=0,
+            finished=False,
+            next_page_no=1,
+            page_counts=[],
+        )
+        self._write_state(req.job_id, status)
+        return status
+
+    def _validate_sorted_segment(
+        self, job_id: str, path: Path, key_field: str, rel: str
+    ) -> None:
+        """流式校验：每行是 JSON 对象，键为整数，且键非降序。
+
+        句柄走共享额度器；出错时 ``hold()`` 会归还名额。
+        """
         prev: int | None = None
-        with open(path, "rb") as f:
+        with self.limiter.hold((job_id, "validate", rel), path, 0) as f:
             for lineno, raw in enumerate(f, 1):
                 if not raw.strip():
                     continue
@@ -289,6 +591,12 @@ class MergeService:
         if changed:
             self._write_state(job_id, status)
 
+        # 2b) 已被回收/耗尽的段不再需要读句柄，关掉缓存里的，避免空占额度
+        for idx, seg in enumerate(status.segments):
+            if seg.exhausted or seg.reclaimed:
+                self.limiter.discard((job_id, "read", idx))
+                self.limiter.discard((job_id, "validate", seg.path))
+
         return status
 
     # ------------------------------------------------------------------ #
@@ -296,7 +604,14 @@ class MergeService:
     # ------------------------------------------------------------------ #
     def advance(self, job_id: str) -> AdvanceResult:
         with self._get_lock(job_id):
-            return self._advance_locked(job_id)
+            try:
+                return self._advance_locked(job_id)
+            except BaseException:
+                # 本次推进失败：关闭该作业缓存的输入句柄，把名额还给
+                # 全局额度。状态尚未提交的部分保持在磁盘上的上一次
+                # 已提交进度，重试从那里继续。
+                self.limiter.drop_job(job_id)
+                raise
 
     def _advance_locked(self, job_id: str) -> AdvanceResult:
         status = self._open_job(job_id)
@@ -315,7 +630,9 @@ class MergeService:
         readers: dict[int, _RunReader] = {}
         heap: list[_HeapEntry] = []
 
-        # 打开每一路，seek 到持久化偏移，载入第一条待比较记录
+        # 打开每一路，seek 到持久化偏移，载入第一条待比较记录。
+        # 这里不为每一路长期持有句柄：_next_entry 每次按需取一个，
+        # 用后立即归还，所以路数可以超过进程句柄额度。
         for idx, seg in enumerate(status.segments):
             if seg.exhausted:
                 continue
@@ -324,9 +641,9 @@ class MergeService:
                 raise EngineError(
                     f"段文件 {seg.path} 已不存在但作业尚未消费完，无法续跑"
                 )
-            f = open(p, "rb")
-            f.seek(seg.offset)
-            reader = _RunReader(index=idx, state=seg, f=f, seq=0)
+            reader = _RunReader(
+                index=idx, job_id=job_id, state=seg, path=p, seq=0, pos=seg.offset
+            )
             readers[idx] = reader
             entry = self._next_entry(reader, key_field)
             if entry is not None:
@@ -334,95 +651,101 @@ class MergeService:
             # 第一条就为空（offset 已到 EOF）：留到发布后统一标记 exhausted
 
         page_records: list[bytes] = []
-        try:
-            while heap and len(page_records) < page_size:
-                top = heapq.heappop(heap)
-                page_records.append(top.raw)
-                reader = readers[top.run_index]
-                nxt = self._next_entry(reader, key_field)
-                if nxt is not None:
-                    heapq.heappush(heap, nxt)
+        while heap and len(page_records) < page_size:
+            top = heapq.heappop(heap)
+            page_records.append(top.raw)
+            reader = readers[top.run_index]
+            nxt = self._next_entry(reader, key_field)
+            if nxt is not None:
+                heapq.heappush(heap, nxt)
 
-            if not page_records:
-                # 没有任何待处理记录：收尾结束（无新页，不改动已发布内容）
-                for reader in readers.values():
-                    reader.state.exhausted = True
-                status.finished = True
-                reclaimed = self._commit_and_reclaim(job_id, status)
-                return AdvanceResult(
-                    page_no=None,
-                    page_size=page_size,
-                    rows=0,
-                    finished=True,
-                    reclaimed=reclaimed,
-                    status=status,
-                )
-
-            page_no = status.next_page_no
-            page_path = self._job_dir(job_id) / page_filename(page_no)
-
-            # 1) 原子发布页（tmp -> fsync -> rename）
-            payload = b"".join(page_records)
-            atomic_write_bytes(
-                page_path,
-                payload,
-                crash_hook=self._crash_hook,
-                pre_rename_hook="after_page_tmp",
-                post_rename_hook="after_page_rename",
-            )
-
-            # 2) 推进各路偏移 / 耗尽标记
-            # 堆里还留着的路说明仍有待处理记录；不在堆里的路已 EOF。
-            # 注意：堆中持有的那条记录已经从文件预读出来，因此存活路
-            # 必须持久化该记录的起始偏移（entry.offset），而不是
-            # f.tell()，否则重启 seek 会跳过它造成丢记录。
-            alive_indexes = {e.run_index for e in heap}
-            held_offsets = {e.run_index: e.offset for e in heap}
-            for idx, reader in readers.items():
-                seg = reader.state
-                if idx not in alive_indexes:
-                    seg.exhausted = True
-                    seg.offset = reader.f.tell()
-                else:
-                    seg.offset = held_offsets[idx]
-
-            # 3) 更新作业状态（此时先不置 reclaimed，见 _commit_and_reclaim）
-            status.published_pages += 1
-            status.total_published_rows += len(page_records)
-            status.page_counts.append(len(page_records))
-            if not heap:
-                # 所有路都耗尽：只有末页允许短
-                status.finished = True
-            status.next_page_no = status.published_pages + 1
-
-            # 4) 先提交“耗尽 + 偏移”状态，再回收段文件，最后补提交
-            #    reclaimed 标记。这样“未消费但段文件缺失”不可能由本
-            #    服务自身的崩溃造成；unlink 后崩溃由启动对账补做回收。
-            reclaimed_now = self._commit_and_reclaim(job_id, status)
-
+        if not page_records:
+            # 没有任何待处理记录：收尾结束（无新页，不改动已发布内容）
+            for reader in readers.values():
+                reader.state.exhausted = True
+            status.finished = True
+            reclaimed = self._commit_and_reclaim(job_id, status)
             return AdvanceResult(
-                page_no=page_no,
+                page_no=None,
                 page_size=page_size,
-                rows=len(page_records),
-                finished=status.finished,
-                reclaimed=reclaimed_now,
+                rows=0,
+                finished=True,
+                reclaimed=reclaimed,
                 status=status,
             )
-        finally:
-            for reader in readers.values():
-                reader.f.close()
+
+        page_no = status.next_page_no
+        page_path = self._job_dir(job_id) / page_filename(page_no)
+
+        # 1) 原子发布页（tmp -> fsync -> rename）
+        payload = b"".join(page_records)
+        atomic_write_bytes(
+            page_path,
+            payload,
+            crash_hook=self._crash_hook,
+            pre_rename_hook="after_page_tmp",
+            post_rename_hook="after_page_rename",
+        )
+
+        # 2) 推进各路偏移 / 耗尽标记
+        # 堆里还留着的路说明仍有待处理记录；不在堆里的路已 EOF。
+        # 堆中持有的那条记录已经预读出来，存活路必须持久化该记录的
+        # 起始偏移（entry.offset），而不是 reader.pos，否则重启 seek
+        # 会跳过它造成丢记录。
+        alive_indexes = {e.run_index for e in heap}
+        held_offsets = {e.run_index: e.offset for e in heap}
+        for idx, reader in readers.items():
+            seg = reader.state
+            if idx not in alive_indexes:
+                seg.exhausted = True
+                seg.offset = reader.pos
+            else:
+                seg.offset = held_offsets[idx]
+
+        # 3) 更新作业状态（此时先不置 reclaimed，见 _commit_and_reclaim）
+        status.published_pages += 1
+        status.total_published_rows += len(page_records)
+        status.page_counts.append(len(page_records))
+        if not heap:
+            # 所有路都耗尽：只有末页允许短
+            status.finished = True
+        status.next_page_no = status.published_pages + 1
+
+        # 4) 先提交“耗尽 + 偏移”状态，再回收段文件，最后补提交
+        #    reclaimed 标记。这样“未消费但段文件缺失”不可能由本
+        #    服务自身的崩溃造成；unlink 后崩溃由启动对账补做回收。
+        reclaimed_now = self._commit_and_reclaim(job_id, status)
+
+        return AdvanceResult(
+            page_no=page_no,
+            page_size=page_size,
+            rows=len(page_records),
+            finished=status.finished,
+            reclaimed=reclaimed_now,
+            status=status,
+        )
 
     def _next_entry(self, reader: _RunReader, key_field: str) -> _HeapEntry | None:
-        """从该路读出下一条记录，返回堆条目；EOF 返回 None。"""
-        f = reader.f
-        start = f.tell()
-        line = f.readline()
-        if line == b"":
-            return None
-        if not line.strip():
-            # 容忍空行：跳过并继续
-            reader.seq += 1
-            return self._next_entry(reader, key_field)
+        """从该路读出下一条记录，返回堆条目；EOF 返回 None。
+
+        每次读取只短暂占用一个句柄；连续读同一路时句柄仍在 LRU 缓存
+        里就直接复用，不会重复 ``open()``。读取抛错时 ``hold`` 会关闭
+        该句柄并归还名额。
+        """
+        with self.limiter.hold(reader.handle_key, reader.path, reader.pos) as f:
+            while True:
+                start = f.tell()
+                line = f.readline()
+                if line == b"":
+                    reader.pos = f.tell()
+                    return None
+                if not line.strip():
+                    # 容忍空行：跳过并继续
+                    reader.seq += 1
+                    reader.pos = f.tell()
+                    continue
+                reader.pos = f.tell()
+                break
         try:
             rec = json.loads(line)
         except json.JSONDecodeError as e:
@@ -434,16 +757,15 @@ class MergeService:
             raise EngineError(
                 f"{reader.state.path} 偏移 {start} 处键字段 {key_field!r} 不是整数"
             )
-        entry = _HeapEntry(
+        reader.seq += 1
+        return _HeapEntry(
             key=key,
             order=reader.state.order,
-            seq=reader.seq,
+            seq=reader.seq - 1,
             run_index=reader.index,
             offset=start,
             raw=line if line.endswith(b"\n") else line + b"\n",
         )
-        reader.seq += 1
-        return entry
 
     def _commit_and_reclaim(self, job_id: str, status: JobStatus) -> list[str]:
         """两阶段回收，保证崩溃后可对账：
@@ -469,6 +791,15 @@ class MergeService:
         if self._crash_hook is not None and reclaimed:
             self._crash_hook("after_reclaim_unlink")
 
+        # 回收后立即释放该段可能仍在 LRU 缓存里的读句柄，让名额马上
+        # 回到全局额度，而不是等到下一次 _open_job 才对账清理。
+        if reclaimed:
+            gone = set(reclaimed)
+            for idx, seg in enumerate(status.segments):
+                if seg.path in gone:
+                    self.limiter.discard((job_id, "read", idx))
+                    self.limiter.discard((job_id, "validate", seg.path))
+
         # 阶段3：提交回收标记
         for path in reclaimed:
             for seg in status.segments:
@@ -489,16 +820,22 @@ class MergeService:
         """
         published: list[int] = []
         with self._get_lock(job_id):
-            while True:
-                result = self._advance_locked(job_id)
-                if result.page_no is not None:
-                    published.append(result.page_no)
-                if result.finished or (max_pages is not None and len(published) >= max_pages):
-                    return RunResult(
-                        published=published,
-                        finished=result.finished,
-                        status=result.status,
-                    )
+            try:
+                while True:
+                    result = self._advance_locked(job_id)
+                    if result.page_no is not None:
+                        published.append(result.page_no)
+                    if result.finished or (
+                        max_pages is not None and len(published) >= max_pages
+                    ):
+                        return RunResult(
+                            published=published,
+                            finished=result.finished,
+                            status=result.status,
+                        )
+            except BaseException:
+                self.limiter.drop_job(job_id)
+                raise
 
     # ------------------------------------------------------------------ #
     # 查询

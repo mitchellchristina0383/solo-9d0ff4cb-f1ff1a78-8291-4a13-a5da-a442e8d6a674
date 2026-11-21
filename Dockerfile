@@ -13,7 +13,8 @@ COPY app /srv/app
 
 # 挂载目录（输入段，可写以便回收）与工作目录（状态 + 已发布页）
 ENV MERGE_MOUNT_DIR=/data/input \
-    MERGE_WORK_DIR=/data/work
+    MERGE_WORK_DIR=/data/work \
+    MERGE_MAX_OPEN_INPUT_FILES=4
 RUN mkdir -p /data/input /data/work
 
 EXPOSE 8000

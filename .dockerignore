@@ -1,4 +1,5 @@
 .venv/
+.pylibs/
 .git/
 __pycache__/
 *.pyc

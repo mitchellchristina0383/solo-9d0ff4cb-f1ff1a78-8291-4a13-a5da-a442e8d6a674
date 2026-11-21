@@ -1,0 +1,103 @@
+{
+  "job_id": "wide",
+  "key_field": "key",
+  "page_size": 6,
+  "segments": [
+    {
+      "path": "wide/run-000.jsonl",
+      "order": 0
+    },
+    {
+      "path": "wide/run-001.jsonl",
+      "order": 1
+    },
+    {
+      "path": "wide/run-002.jsonl",
+      "order": 2
+    },
+    {
+      "path": "wide/run-003.jsonl",
+      "order": 3
+    },
+    {
+      "path": "wide/run-004.jsonl",
+      "order": 4
+    },
+    {
+      "path": "wide/run-005.jsonl",
+      "order": 5
+    },
+    {
+      "path": "wide/run-006.jsonl",
+      "order": 6
+    },
+    {
+      "path": "wide/run-007.jsonl",
+      "order": 7
+    },
+    {
+      "path": "wide/run-008.jsonl",
+      "order": 8
+    },
+    {
+      "path": "wide/run-009.jsonl",
+      "order": 9
+    },
+    {
+      "path": "wide/run-010.jsonl",
+      "order": 10
+    },
+    {
+      "path": "wide/run-011.jsonl",
+      "order": 11
+    },
+    {
+      "path": "wide/run-012.jsonl",
+      "order": 12
+    },
+    {
+      "path": "wide/run-013.jsonl",
+      "order": 13
+    },
+    {
+      "path": "wide/run-014.jsonl",
+      "order": 14
+    },
+    {
+      "path": "wide/run-015.jsonl",
+      "order": 15
+    },
+    {
+      "path": "wide/run-016.jsonl",
+      "order": 16
+    },
+    {
+      "path": "wide/run-017.jsonl",
+      "order": 17
+    },
+    {
+      "path": "wide/run-018.jsonl",
+      "order": 18
+    },
+    {
+      "path": "wide/run-019.jsonl",
+      "order": 19
+    },
+    {
+      "path": "wide/run-020.jsonl",
+      "order": 20
+    },
+    {
+      "path": "wide/run-021.jsonl",
+      "order": 21
+    },
+    {
+      "path": "wide/run-022.jsonl",
+      "order": 22
+    },
+    {
+      "path": "wide/run-023.jsonl",
+      "order": 23
+    }
+  ]
+}

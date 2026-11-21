@@ -9,6 +9,10 @@ services:
       # 容器内路径，对应下方两个卷挂载
       MERGE_MOUNT_DIR: /data/input
       MERGE_WORK_DIR: /data/work
+      # 进程级输入段句柄额度：登记校验、单步推进、连续运行共用。
+      # 路数可以超过该值（样例 job.wide.json 有 24 路而这里是 4）。
+      # 可被宿主机环境变量覆盖：MERGE_MAX_OPEN_INPUT_FILES=8 docker compose up
+      MERGE_MAX_OPEN_INPUT_FILES: ${MERGE_MAX_OPEN_INPUT_FILES:-4}
     volumes:
       # 各路 JSONL 段文件挂这里；归并发布后服务会回收（删除）已消费完的段
       - ./sample/input:/data/input
